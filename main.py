@@ -1,523 +1,732 @@
-import io
-import time
-from dataclasses import dataclass
-from typing import Dict, Tuple, List
-
+import streamlit as st
 import numpy as np
 import pandas as pd
-import streamlit as st
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
 
-from PIL import Image, ImageOps
-
-from sklearn.datasets import fetch_openml
-from sklearn.model_selection import (
-    train_test_split,
-    StratifiedKFold,
-    RepeatedStratifiedKFold,
-    ShuffleSplit,
-    StratifiedShuffleSplit,
-    cross_validate,
-    learning_curve,
-)
-from sklearn.pipeline import Pipeline
+from sklearn.datasets import load_digits
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (
+    accuracy_score, classification_report, confusion_matrix,
+    ConfusionMatrixDisplay
+)
 
+# Models
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.naive_bayes import GaussianNB, MultinomialNB
+from sklearn.naive_bayes import GaussianNB
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.tree import DecisionTreeClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 
+# Drawing canvas
 from streamlit_drawable_canvas import st_canvas
+from PIL import Image
+import cv2
 
+# ─────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────
+st.set_page_config(
+    page_title="MNIST Classifier Studio",
+    page_icon="🔢",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# ----------------------------
-# Data loading + quality checks
-# ----------------------------
-@st.cache_data(show_spinner=False)
-def load_mnist_openml(sample_limit: int = 70000) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Loads MNIST from OpenML via sklearn. Returns X (float32) and y (int64).
-    Note: This is the standard MNIST (70k samples, 784 features).
-    """
-    mnist = fetch_openml("mnist_784", version=1, as_frame=False)
-    X = mnist.data.astype(np.float32)
-    y = mnist.target.astype(np.int64)
+# ─────────────────────────────────────────────
+# CUSTOM CSS
+# ─────────────────────────────────────────────
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.4rem;
+        font-weight: 800;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 0.2rem;
+    }
+    .sub-header {
+        color: #6b7280;
+        font-size: 1rem;
+        margin-bottom: 2rem;
+    }
+    .metric-card {
+        background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+        border-left: 4px solid #667eea;
+        padding: 1rem 1.2rem;
+        border-radius: 8px;
+        margin: 0.4rem 0;
+    }
+    .metric-value {
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #1e293b;
+    }
+    .metric-label {
+        font-size: 0.8rem;
+        color: #64748b;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+    .section-title {
+        font-size: 1.3rem;
+        font-weight: 700;
+        color: #1e293b;
+        border-bottom: 2px solid #e2e8f0;
+        padding-bottom: 0.4rem;
+        margin: 1.5rem 0 1rem 0;
+    }
+    .warning-box {
+        background: #fef3c7;
+        border-left: 4px solid #f59e0b;
+        padding: 0.8rem 1rem;
+        border-radius: 6px;
+        color: #78350f;
+        font-size: 0.9rem;
+    }
+    .success-box {
+        background: #d1fae5;
+        border-left: 4px solid #10b981;
+        padding: 0.8rem 1rem;
+        border-radius: 6px;
+        color: #065f46;
+        font-size: 0.9rem;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 6px 6px 0 0;
+        padding: 8px 20px;
+        font-weight: 600;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-    if sample_limit is not None and sample_limit < X.shape[0]:
-        # deterministic subset (no leakage risk; just slicing)
-        X = X[:sample_limit]
-        y = y[:sample_limit]
+# ─────────────────────────────────────────────
+# HELPERS / CACHE
+# ─────────────────────────────────────────────
+@st.cache_data
+def load_data():
+    digits = load_digits()
+    X = digits.data.astype(np.float32)
+    y = digits.target
+    return X, y, digits
 
-    return X, y
-
-
-def data_quality_report(X: np.ndarray, y: np.ndarray) -> Dict[str, object]:
-    """
-    Verifies basic data quality. Pure inspection only (no fitting -> no leakage).
-    """
+def data_quality_report(X, y):
     report = {}
-    report["X_shape"] = X.shape
-    report["y_shape"] = y.shape
-    report["X_dtype"] = str(X.dtype)
-    report["y_dtype"] = str(y.dtype)
-
-    # Missing / invalid checks
-    report["missing_in_X"] = int(np.isnan(X).sum())
-    report["missing_in_y"] = int(np.isnan(y).sum()) if np.issubdtype(y.dtype, np.floating) else 0
-    report["inf_in_X"] = int(np.isinf(X).sum())
-    report["min_pixel"] = float(np.min(X))
-    report["max_pixel"] = float(np.max(X))
-
-    # Label distribution
-    labels, counts = np.unique(y, return_counts=True)
-    report["class_distribution"] = dict(zip(labels.tolist(), counts.tolist()))
-    report["num_classes"] = int(len(labels))
-    report["unique_labels"] = labels.tolist()
-
+    report['n_samples'] = X.shape[0]
+    report['n_features'] = X.shape[1]
+    report['n_classes'] = len(np.unique(y))
+    report['missing_values'] = int(np.isnan(X).sum())
+    report['duplicate_rows'] = int(pd.DataFrame(X).duplicated().sum())
+    report['class_counts'] = pd.Series(y).value_counts().sort_index()
+    report['feature_range'] = (float(X.min()), float(X.max()))
+    report['zero_variance_feats'] = int((X.var(axis=0) == 0).sum())
     return report
 
-
-# ----------------------------
-# CV strategies (NO leakage)
-# ----------------------------
-def make_cv(strategy: str, n_splits: int, random_state: int):
-    if strategy == "StratifiedKFold":
-        return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-    if strategy == "RepeatedStratifiedKFold":
-        return RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=2, random_state=random_state)
-    if strategy == "ShuffleSplit":
-        return ShuffleSplit(n_splits=max(10, n_splits), test_size=0.2, random_state=random_state)
-    if strategy == "StratifiedShuffleSplit":
-        return StratifiedShuffleSplit(n_splits=max(10, n_splits), test_size=0.2, random_state=random_state)
-    raise ValueError(f"Unknown CV strategy: {strategy}")
-
-
-# ----------------------------
-# Models
-# ----------------------------
-@dataclass
-class ModelSpec:
-    name: str
-    estimator: object
-
-
-def get_model_specs(random_state: int) -> List[ModelSpec]:
-    """
-    You asked for: knn, bayes, svm, rf, dt, mc, ann.
-    We'll train all 7 (so you can compare).
-    """
-    return [
-        ModelSpec("KNN", KNeighborsClassifier(n_neighbors=5)),
-        ModelSpec("Bayes (GaussianNB)", GaussianNB()),
-        ModelSpec("SVM (RBF)", SVC(kernel="rbf", gamma="scale", C=3.0)),
-        ModelSpec("Random Forest", RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1)),
-        ModelSpec("Decision Tree", DecisionTreeClassifier(random_state=random_state)),
-        ModelSpec("Bayes (MultinomialNB)", MultinomialNB(alpha=1.0)),
-        ModelSpec("ANN (MLP)", MLPClassifier(hidden_layer_sizes=(128,), max_iter=15, random_state=random_state)),
-    ]
-
-
-def build_pipeline(estimator, use_pca: bool, pca_components: int, for_multinomial_nb: bool) -> Pipeline:
-    """
-    IMPORTANT (no leakage):
-    - ALL transforms (scaler / PCA) live inside the pipeline.
-    - During CV, each fold fits transforms only on that fold’s training split.
-    """
-    steps = []
-
-    # MultinomialNB expects non-negative features. MNIST pixels are 0..255 already.
-    # Scaling to mean=0 would create negatives -> keep raw if multinomial.
-    if not for_multinomial_nb:
-        steps.append(("scaler", StandardScaler(with_mean=True, with_std=True)))
-
+def build_pipeline(model, use_pca, pca_components=30):
+    steps = [('scaler', StandardScaler())]
     if use_pca:
-        steps.append(("pca", PCA(n_components=pca_components, random_state=0)))
-
-    steps.append(("model", estimator))
+        steps.append(('pca', PCA(n_components=pca_components, random_state=42)))
+    steps.append(('clf', model))
     return Pipeline(steps)
 
+MODELS = {
+    'KNN': KNeighborsClassifier(n_neighbors=5),
+    'Naive Bayes': GaussianNB(),
+    'SVM': SVC(kernel='rbf', C=10, gamma='scale', probability=True, random_state=42),
+    'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
+    'Decision Tree': DecisionTreeClassifier(max_depth=15, random_state=42),
+    'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42),
+    'ANN (MLP)': MLPClassifier(hidden_layer_sizes=(256, 128), max_iter=300,
+                               random_state=42, early_stopping=True),
+}
 
-# ----------------------------
-# Training + evaluation
-# ----------------------------
-@st.cache_resource(show_spinner=False)
-def train_and_evaluate(
-    train_fraction: float,
-    use_pca: bool,
-    pca_components: int,
-    cv_strategy: str,
-    cv_splits: int,
-    random_state: int,
-    sample_limit: int,
-) -> Dict[str, object]:
-    """
-    Returns trained pipelines and metrics.
-    NO leakage:
-    - We first split into (train, test).
-    - We do cross-validation ONLY on train.
-    - Then fit each pipeline on full train and evaluate on held-out test.
-    """
-    X, y = load_mnist_openml(sample_limit=sample_limit)
+MODEL_COLORS = {
+    'KNN': '#3b82f6',
+    'Naive Bayes': '#f59e0b',
+    'SVM': '#8b5cf6',
+    'Random Forest': '#10b981',
+    'Decision Tree': '#ef4444',
+    'Logistic Regression': '#06b6d4',
+    'ANN (MLP)': '#ec4899',
+}
 
-    # Hold-out test split (never touched by CV fitting)
-    X_train_full, X_test, y_train_full, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=random_state, stratify=y
+@st.cache_data(show_spinner=False)
+def run_experiments(train_size, use_pca, pca_components, cv_folds):
+    X, y, _ = load_data()
+
+    # Split BEFORE any fitting — no leakage
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, train_size=train_size, random_state=42, stratify=y
     )
 
-    # User-controlled training fraction (subsample ONLY from training split)
-    if not (0.05 <= train_fraction <= 1.0):
-        raise ValueError("train_fraction must be between 0.05 and 1.0")
+    results = {}
+    cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
 
-    n_train = int(len(X_train_full) * train_fraction)
-    rng = np.random.default_rng(random_state)
-    idx = rng.choice(len(X_train_full), size=n_train, replace=False)
-    X_train = X_train_full[idx]
-    y_train = y_train_full[idx]
+    for name, base_model in MODELS.items():
+        pipe = build_pipeline(base_model, use_pca, pca_components)
 
-    cv = make_cv(cv_strategy, n_splits=cv_splits, random_state=random_state)
-
-    model_specs = get_model_specs(random_state=random_state)
-
-    rows = []
-    trained_pipelines = {}
-
-    for spec in model_specs:
-        is_multinomial = spec.name.startswith("Bayes (MultinomialNB)")
-        pipe = build_pipeline(
-            estimator=spec.estimator,
-            use_pca=use_pca,
-            pca_components=pca_components,
-            for_multinomial_nb=is_multinomial,
+        # Cross-validation on TRAINING data only (no leakage)
+        cv_res = cross_validate(
+            pipe, X_train, y_train, cv=cv,
+            scoring=['accuracy', 'f1_macro'],
+            return_train_score=True, n_jobs=-1
         )
 
-        # Cross-validate on TRAIN ONLY
-        scoring = {"acc": "accuracy", "f1": "f1_macro"}
-        cv_out = cross_validate(
-            pipe,
-            X_train,
-            y_train,
-            cv=cv,
-            scoring=scoring,
-            return_train_score=True,
-            n_jobs=-1,
-        )
-
-        cv_train_acc = float(np.mean(cv_out["train_acc"]))
-        cv_val_acc = float(np.mean(cv_out["test_acc"]))
-        cv_train_f1 = float(np.mean(cv_out["train_f1"]))
-        cv_val_f1 = float(np.mean(cv_out["test_f1"]))
-
-        # Fit on full (subsampled) train, then evaluate on held-out test
+        # Fit on full training set, predict on held-out test
         pipe.fit(X_train, y_train)
+        y_pred_train = pipe.predict(X_train)
         y_pred_test = pipe.predict(X_test)
 
-        test_acc = float(accuracy_score(y_test, y_pred_test))
-        test_f1 = float(f1_score(y_test, y_pred_test, average="macro"))
-
-        trained_pipelines[spec.name] = pipe
-
-        rows.append(
-            {
-                "Model": spec.name,
-                "CV Train Acc (mean)": cv_train_acc,
-                "CV Val Acc (mean)": cv_val_acc,
-                "CV Train F1-macro (mean)": cv_train_f1,
-                "CV Val F1-macro (mean)": cv_val_f1,
-                "Test Acc (holdout)": test_acc,
-                "Test F1-macro (holdout)": test_f1,
-            }
-        )
-
-    metrics_df = pd.DataFrame(rows).sort_values(by="CV Val Acc (mean)", ascending=False).reset_index(drop=True)
-
-    # Choose best by CV Val Acc
-    best_model_name = str(metrics_df.loc[0, "Model"])
-    best_pipe = trained_pipelines[best_model_name]
-
-    # Confusion matrix for best model (on holdout test)
-    y_pred_best = best_pipe.predict(X_test)
-    cm = confusion_matrix(y_test, y_pred_best, labels=np.arange(10))
-
-    # Learning curve for best model (on TRAIN ONLY)
-    # We evaluate train/val scores as training size increases.
-    train_sizes, train_scores, val_scores = learning_curve(
-        best_pipe,
-        X_train,
-        y_train,
-        cv=cv,
-        scoring="accuracy",
-        n_jobs=-1,
-        train_sizes=np.linspace(0.1, 1.0, 6),
-    )
-
-    return {
-        "X_shape": X.shape,
-        "train_size_used": len(X_train),
-        "test_size": len(X_test),
-        "metrics_df": metrics_df,
-        "trained_pipelines": trained_pipelines,
-        "best_model_name": best_model_name,
-        "confusion_matrix": cm,
-        "learning_curve": {
-            "train_sizes": train_sizes,
-            "train_scores_mean": np.mean(train_scores, axis=1),
-            "val_scores_mean": np.mean(val_scores, axis=1),
-        },
-        # Keep a tiny sample of test set for potential debug/visuals (not needed for training)
-        "test_pack": (X_test[:2000], y_test[:2000]),
-    }
-
-
-# ----------------------------
-# Drawing -> MNIST preprocessing
-# ----------------------------
-def canvas_to_mnist_vector(canvas_rgba: np.ndarray) -> np.ndarray:
-    """
-    Convert canvas RGBA (H,W,4) to MNIST-like 28x28 flattened vector in [0,255].
-    Assumes user draws black on white background (default).
-    """
-    img = Image.fromarray(canvas_rgba.astype(np.uint8), mode="RGBA")
-    img = img.convert("L")  # grayscale
-
-    # Invert so that drawn strokes become "bright" like MNIST digits (white on black)
-    img = ImageOps.invert(img)
-
-    # Crop around content (optional but helpful)
-    bbox = img.getbbox()
-    if bbox is not None:
-        img = img.crop(bbox)
-
-    # Resize to 28x28
-    img = img.resize((28, 28), resample=Image.Resampling.LANCZOS)
-
-    # Convert to numpy
-    arr = np.array(img).astype(np.float32)
-
-    # Normalize to 0..255 (already should be)
-    arr = np.clip(arr, 0, 255)
-
-    return arr.reshape(1, -1)
-
-
-# ----------------------------
-# UI
-# ----------------------------
-st.set_page_config(page_title="MNIST Model Lab (No Leakage)", layout="wide")
-st.title("MNIST Classification Lab (Streamlit)")
-
-with st.expander("What this app guarantees (important)"):
-    st.markdown(
-        """
-- **No data leakage**: the test set is split **first** and never used for cross-validation fitting.
-- All preprocessing (scaling / PCA) is done **inside sklearn Pipelines**, so folds don’t “see” each other.
-- The “% of training data” slider only subsamples from the training split (never from test).
-"""
-    )
-
-# Sidebar controls
-st.sidebar.header("Controls")
-
-train_pct = st.sidebar.slider("Training data fraction (of training split)", min_value=5, max_value=100, value=30, step=5)
-train_fraction = train_pct / 100.0
-
-use_pca = st.sidebar.checkbox("Use PCA", value=True)
-pca_components = st.sidebar.slider("PCA components", min_value=10, max_value=200, value=60, step=10, disabled=not use_pca)
-
-cv_strategy = st.sidebar.selectbox(
-    "Cross-validation strategy",
-    ["StratifiedKFold", "RepeatedStratifiedKFold", "ShuffleSplit", "StratifiedShuffleSplit"],
-    index=0,
-)
-cv_splits = st.sidebar.slider("CV splits (or base splits)", min_value=3, max_value=10, value=5, step=1)
-
-sample_limit = st.sidebar.selectbox("Dataset size (speed control)", [70000, 30000, 15000, 8000], index=2)
-
-random_state = st.sidebar.number_input("Random seed", min_value=0, max_value=9999, value=42, step=1)
-
-run = st.sidebar.button("Run training", type="primary")
-
-# Load + quality check
-X, y = load_mnist_openml(sample_limit=sample_limit)
-dq = data_quality_report(X, y)
-
-col_a, col_b = st.columns([1, 1])
-with col_a:
-    st.subheader("Data quality checks")
-    st.json(
-        {
-            "X_shape": dq["X_shape"],
-            "y_shape": dq["y_shape"],
-            "X_dtype": dq["X_dtype"],
-            "y_dtype": dq["y_dtype"],
-            "missing_in_X": dq["missing_in_X"],
-            "inf_in_X": dq["inf_in_X"],
-            "pixel_range": [dq["min_pixel"], dq["max_pixel"]],
-            "num_classes": dq["num_classes"],
+        results[name] = {
+            'pipe': pipe,
+            'cv_train_acc': cv_res['train_accuracy'],
+            'cv_val_acc': cv_res['test_accuracy'],
+            'cv_train_f1': cv_res['train_f1_macro'],
+            'cv_val_f1': cv_res['test_f1_macro'],
+            'train_acc': accuracy_score(y_train, y_pred_train),
+            'test_acc': accuracy_score(y_test, y_pred_test),
+            'y_pred_test': y_pred_test,
+            'y_test': y_test,
         }
+
+    return results, X_train, X_test, y_train, y_test
+
+
+def preprocess_canvas_image(image_data):
+    """Convert canvas RGBA → 8x8 grayscale matching sklearn digits format."""
+    img = Image.fromarray(image_data.astype(np.uint8))
+    img = img.convert('L')
+    img_array = np.array(img)
+    # Invert if white-on-black
+    if img_array.mean() > 127:
+        img_array = 255 - img_array
+    img_resized = cv2.resize(img_array, (8, 8), interpolation=cv2.INTER_AREA)
+    img_scaled = img_resized / img_resized.max() * 16.0 if img_resized.max() > 0 else img_resized
+    return img_scaled.flatten().reshape(1, -1)
+
+
+# ─────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ⚙️ Configuration")
+    st.markdown("---")
+
+    train_pct = st.slider(
+        "Training data size (%)",
+        min_value=30, max_value=90, value=70, step=5,
+        help="Percentage of data used for training. The rest becomes the test set."
     )
+    train_size = train_pct / 100.0
 
-with col_b:
-    st.subheader("Class distribution")
-    dist = pd.DataFrame({"digit": list(dq["class_distribution"].keys()), "count": list(dq["class_distribution"].values())})
-    st.dataframe(dist, use_container_width=True)
+    st.markdown("---")
+    use_pca = st.checkbox("Apply PCA preprocessing", value=False,
+                          help="Reduces feature dimensions before training.")
+    pca_components = 30
+    if use_pca:
+        pca_components = st.slider("PCA components", 10, 60, 30, 5)
 
-# Show a few sample images
-with st.expander("Preview some MNIST samples"):
-    n_show = 12
-    idxs = np.random.default_rng(random_state).choice(len(X), size=n_show, replace=False)
-    fig, axes = plt.subplots(3, 4, figsize=(8, 6))
-    axes = axes.ravel()
-    for ax, i in zip(axes, idxs):
-        ax.imshow(X[i].reshape(28, 28), cmap="gray")
-        ax.set_title(f"y={y[i]}")
-        ax.axis("off")
+    st.markdown("---")
+    cv_folds = st.slider("Cross-validation folds (StratifiedKFold)",
+                         min_value=3, max_value=10, value=5, step=1)
+
+    st.markdown("---")
+    run_btn = st.button("🚀 Train All Models", use_container_width=True, type="primary")
+
+    st.markdown("---")
+    st.markdown("""
+    <div style='font-size:0.78rem; color:#94a3b8;'>
+    ✅ No data leakage: scaling & PCA fit only on training data via Pipeline.<br><br>
+    📊 Cross-validation performed on train split only.
+    </div>
+    """, unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────
+# MAIN CONTENT
+# ─────────────────────────────────────────────
+st.markdown('<div class="main-header">🔢 MNIST Classifier Studio</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Train, evaluate, and interact with 7 classification models on handwritten digits</div>', unsafe_allow_html=True)
+
+tab_data, tab_train, tab_perf, tab_draw = st.tabs([
+    "📊 Data Quality", "🏋️ Training", "📈 Performance", "✏️ Draw & Classify"
+])
+
+# ═══════════════════════════════════════════════
+# TAB 1 — DATA QUALITY
+# ═══════════════════════════════════════════════
+with tab_data:
+    X_raw, y_raw, digits_obj = load_data()
+    report = data_quality_report(X_raw, y_raw)
+
+    st.markdown('<div class="section-title">Dataset Overview</div>', unsafe_allow_html=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(f"""<div class="metric-card">
+            <div class="metric-value">{report['n_samples']:,}</div>
+            <div class="metric-label">Total Samples</div></div>""", unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"""<div class="metric-card">
+            <div class="metric-value">{report['n_features']}</div>
+            <div class="metric-label">Features (8×8 pixels)</div></div>""", unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"""<div class="metric-card">
+            <div class="metric-value">{report['n_classes']}</div>
+            <div class="metric-label">Classes (0–9)</div></div>""", unsafe_allow_html=True)
+    with c4:
+        st.markdown(f"""<div class="metric-card">
+            <div class="metric-value">{report['missing_values']}</div>
+            <div class="metric-label">Missing Values</div></div>""", unsafe_allow_html=True)
+
+    st.markdown("")
+
+    if report['missing_values'] == 0 and report['zero_variance_feats'] == 0:
+        st.markdown('<div class="success-box">✅ No missing values or zero-variance features detected. Dataset is clean.</div>',
+                    unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="warning-box">⚠️ Found {report["missing_values"]} missing values and {report["zero_variance_feats"]} zero-variance features.</div>',
+                    unsafe_allow_html=True)
+
+    col_left, col_right = st.columns([1, 1])
+
+    with col_left:
+        st.markdown('<div class="section-title">Class Distribution</div>', unsafe_allow_html=True)
+        fig, ax = plt.subplots(figsize=(6, 3.5))
+        bars = ax.bar(report['class_counts'].index, report['class_counts'].values,
+                      color=[MODEL_COLORS.get(k, '#667eea') for k in ['KNN','Naive Bayes','SVM','Random Forest',
+                                                                        'Decision Tree','Logistic Regression','ANN (MLP)','KNN','Naive Bayes','SVM']],
+                      edgecolor='white', linewidth=0.8)
+        ax.set_xlabel('Digit Class', fontsize=11)
+        ax.set_ylabel('Count', fontsize=11)
+        ax.set_title('Samples per Class', fontsize=12, fontweight='bold')
+        ax.set_xticks(range(10))
+        for bar, val in zip(bars, report['class_counts'].values):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                    str(val), ha='center', va='bottom', fontsize=9)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+    with col_right:
+        st.markdown('<div class="section-title">Sample Digits</div>', unsafe_allow_html=True)
+        fig, axes = plt.subplots(2, 10, figsize=(10, 2.2))
+        for digit in range(10):
+            idx = np.where(y_raw == digit)[0]
+            for row in range(2):
+                ax = axes[row, digit]
+                ax.imshow(X_raw[idx[row]].reshape(8, 8), cmap='Blues', vmin=0, vmax=16)
+                ax.axis('off')
+                if row == 0:
+                    ax.set_title(str(digit), fontsize=9, fontweight='bold')
+        fig.suptitle('Two samples per digit', fontsize=10, y=1.02)
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+    st.markdown('<div class="section-title">Pixel Intensity Distribution</div>', unsafe_allow_html=True)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 3.5))
+
+    axes[0].hist(X_raw.flatten(), bins=17, range=(-0.5, 16.5),
+                 color='#667eea', edgecolor='white', alpha=0.85)
+    axes[0].set_xlabel('Pixel Value (0–16)', fontsize=11)
+    axes[0].set_ylabel('Frequency', fontsize=11)
+    axes[0].set_title('Global Pixel Intensity Distribution', fontsize=12, fontweight='bold')
+    axes[0].spines['top'].set_visible(False)
+    axes[0].spines['right'].set_visible(False)
+
+    feature_means = X_raw.mean(axis=0).reshape(8, 8)
+    im = axes[1].imshow(feature_means, cmap='YlOrRd')
+    axes[1].set_title('Average Pixel Intensity per Position', fontsize=12, fontweight='bold')
+    axes[1].set_xticks([])
+    axes[1].set_yticks([])
+    plt.colorbar(im, ax=axes[1])
+
+    fig.tight_layout()
     st.pyplot(fig)
+    plt.close()
 
-# Run training/eval
-if run:
-    with st.spinner("Training models + cross-validation (train-only) + holdout test evaluation..."):
-        t0 = time.time()
-        results = train_and_evaluate(
-            train_fraction=train_fraction,
-            use_pca=use_pca,
-            pca_components=int(pca_components),
-            cv_strategy=cv_strategy,
-            cv_splits=int(cv_splits),
-            random_state=int(random_state),
-            sample_limit=int(sample_limit),
-        )
-        st.session_state["results"] = results
-        st.session_state["trained_pipelines"] = results["trained_pipelines"]
-        st.session_state["best_model_name"] = results["best_model_name"]
-        st.session_state["use_pca"] = use_pca
-        st.session_state["pca_components"] = int(pca_components)
-        st.session_state["random_state"] = int(random_state)
-        st.session_state["train_fraction"] = train_fraction
-        st.session_state["cv_strategy"] = cv_strategy
-        st.session_state["cv_splits"] = int(cv_splits)
-        st.session_state["sample_limit"] = int(sample_limit)
-        t1 = time.time()
+    if use_pca:
+        st.markdown('<div class="section-title">PCA Variance Analysis (train data preview)</div>', unsafe_allow_html=True)
+        X_train_prev, _, _, _ = train_test_split(X_raw, y_raw, train_size=train_size,
+                                                  random_state=42, stratify=y_raw)
+        scaler_prev = StandardScaler()
+        X_scaled_prev = scaler_prev.fit_transform(X_train_prev)
+        pca_prev = PCA(n_components=min(60, X_scaled_prev.shape[1]), random_state=42)
+        pca_prev.fit(X_scaled_prev)
+        cumvar = np.cumsum(pca_prev.explained_variance_ratio_) * 100
 
-    st.success(f"Done in {t1 - t0:.1f}s. Best model by CV Val Acc: {results['best_model_name']}")
+        fig, ax = plt.subplots(figsize=(8, 3.5))
+        ax.plot(range(1, len(cumvar)+1), cumvar, color='#667eea', linewidth=2)
+        ax.axhline(y=95, color='#ef4444', linestyle='--', linewidth=1.2, label='95% variance')
+        ax.axvline(x=pca_components, color='#10b981', linestyle='--', linewidth=1.2,
+                   label=f'Selected: {pca_components} components')
+        ax.fill_between(range(1, len(cumvar)+1), cumvar, alpha=0.15, color='#667eea')
+        ax.set_xlabel('Number of Components', fontsize=11)
+        ax.set_ylabel('Cumulative Explained Variance (%)', fontsize=11)
+        ax.set_title('PCA Explained Variance Curve (fitted on training data only)', fontsize=12, fontweight='bold')
+        ax.legend(fontsize=10)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close()
 
-# Display results if available
-if "results" in st.session_state:
-    results = st.session_state["results"]
-    metrics_df = results["metrics_df"]
+# ═══════════════════════════════════════════════
+# TAB 2 — TRAINING
+# ═══════════════════════════════════════════════
+with tab_train:
+    st.markdown('<div class="section-title">Training Configuration</div>', unsafe_allow_html=True)
 
-    st.subheader("Model performance summary")
-    st.caption("CV metrics are computed **only on the training split**. Test metrics are on a **held-out** test set.")
-    st.dataframe(metrics_df, use_container_width=True)
+    conf_cols = st.columns(4)
+    with conf_cols[0]:
+        st.info(f"**Train size:** {train_pct}%")
+    with conf_cols[1]:
+        st.info(f"**Test size:** {100 - train_pct}%")
+    with conf_cols[2]:
+        st.info(f"**PCA:** {'Yes – ' + str(pca_components) + ' components' if use_pca else 'No'}")
+    with conf_cols[3]:
+        st.info(f"**CV folds:** {cv_folds} (Stratified K-Fold)")
 
-    # Bar chart: CV Val Acc vs Test Acc
-    st.subheader("Graphs: CV vs Test performance")
+    st.markdown("""
+    <div class="warning-box">
+    🛡️ <b>Data Leakage Prevention:</b> All preprocessing (StandardScaler + optional PCA) is wrapped inside 
+    a <code>sklearn.Pipeline</code> and fitted only on the training fold during cross-validation, 
+    and only on the full training set for final evaluation. The test set is never seen during fitting.
+    </div>
+    """, unsafe_allow_html=True)
 
-    fig1, ax1 = plt.subplots(figsize=(10, 4))
-    x = np.arange(len(metrics_df))
-    ax1.bar(x - 0.2, metrics_df["CV Val Acc (mean)"].values, width=0.4, label="CV Val Acc (mean)")
-    ax1.bar(x + 0.2, metrics_df["Test Acc (holdout)"].values, width=0.4, label="Test Acc (holdout)")
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(metrics_df["Model"].values, rotation=35, ha="right")
-    ax1.set_ylabel("Accuracy")
-    ax1.legend()
-    st.pyplot(fig1)
+    st.markdown("")
 
-    fig2, ax2 = plt.subplots(figsize=(10, 4))
-    ax2.bar(x - 0.2, metrics_df["CV Val F1-macro (mean)"].values, width=0.4, label="CV Val F1 (macro)")
-    ax2.bar(x + 0.2, metrics_df["Test F1-macro (holdout)"].values, width=0.4, label="Test F1 (macro)")
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(metrics_df["Model"].values, rotation=35, ha="right")
-    ax2.set_ylabel("F1-macro")
-    ax2.legend()
-    st.pyplot(fig2)
+    if 'results' not in st.session_state or run_btn:
+        with st.spinner("Training 7 models with cross-validation... This may take ~30 seconds."):
+            results, X_tr, X_te, y_tr, y_te = run_experiments(
+                train_size, use_pca, pca_components, cv_folds
+            )
+        st.session_state['results'] = results
+        st.session_state['splits'] = (X_tr, X_te, y_tr, y_te)
+        st.success("✅ All models trained successfully!")
 
-    # Confusion matrix for best model
-    st.subheader(f"Best model confusion matrix (holdout test): {results['best_model_name']}")
-    cm = results["confusion_matrix"]
-    fig_cm, ax_cm = plt.subplots(figsize=(6, 6))
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=np.arange(10))
-    disp.plot(ax=ax_cm, cmap="Blues", colorbar=False)
-    st.pyplot(fig_cm)
+    if 'results' in st.session_state:
+        results = st.session_state['results']
+        X_tr, X_te, y_tr, y_te = st.session_state['splits']
 
-    # Learning curve (best model)
-    st.subheader("Learning curve (best model, train-only CV)")
-    lc = results["learning_curve"]
-    fig_lc, ax_lc = plt.subplots(figsize=(7, 4))
-    ax_lc.plot(lc["train_sizes"], lc["train_scores_mean"], marker="o", label="Train (CV mean)")
-    ax_lc.plot(lc["train_sizes"], lc["val_scores_mean"], marker="o", label="Validation (CV mean)")
-    ax_lc.set_xlabel("Training samples")
-    ax_lc.set_ylabel("Accuracy")
-    ax_lc.legend()
-    st.pyplot(fig_lc)
+        st.markdown('<div class="section-title">Cross-Validation Results (on Training Data Only)</div>', unsafe_allow_html=True)
 
-# Drawing + prediction
-st.divider()
-st.header("Draw a digit and classify it")
+        cv_df = pd.DataFrame({
+            'Model': list(results.keys()),
+            'CV Val Acc (mean)': [results[m]['cv_val_acc'].mean() for m in results],
+            'CV Val Acc (std)': [results[m]['cv_val_acc'].std() for m in results],
+            'CV Train Acc (mean)': [results[m]['cv_train_acc'].mean() for m in results],
+            'CV Val F1 (mean)': [results[m]['cv_val_f1'].mean() for m in results],
+            'Final Test Acc': [results[m]['test_acc'] for m in results],
+        }).sort_values('CV Val Acc (mean)', ascending=False).reset_index(drop=True)
 
-if "trained_pipelines" not in st.session_state:
-    st.info("Train the models first (click **Run training**) so the app can classify your drawing.")
-else:
-    model_names = list(st.session_state["trained_pipelines"].keys())
-    default_best = st.session_state.get("best_model_name", model_names[0])
-    chosen_model_name = st.selectbox("Choose a trained model for prediction", model_names, index=model_names.index(default_best))
+        cv_df_display = cv_df.copy()
+        for col in cv_df_display.columns[1:]:
+            cv_df_display[col] = cv_df_display[col].map(lambda x: f"{x*100:.2f}%")
 
-    st.caption("Tip: draw a big digit in the center. The app will crop and resize to 28×28 like MNIST.")
+        st.dataframe(cv_df_display, use_container_width=True,
+                     column_config={"Model": st.column_config.TextColumn(width="medium")})
 
-    canvas_result = st_canvas(
-        fill_color="rgba(255, 255, 255, 0)",
-        stroke_width=12,
-        stroke_color="black",
-        background_color="white",
-        width=260,
-        height=260,
-        drawing_mode="freedraw",
-        key="canvas",
-    )
+        # Bias-Variance per model
+        st.markdown('<div class="section-title">Bias–Variance per Fold (CV on Train Split)</div>', unsafe_allow_html=True)
 
-    col1, col2 = st.columns([1, 1])
+        selected_model = st.selectbox("Select model to inspect CV folds:", list(results.keys()))
+        m_res = results[selected_model]
 
-    with col1:
-        if st.button("Classify drawing", type="primary"):
-            if canvas_result.image_data is None:
-                st.warning("Please draw a digit first.")
-            else:
-                vec = canvas_to_mnist_vector(canvas_result.image_data)
+        fig, ax = plt.subplots(figsize=(9, 4))
+        folds = np.arange(1, cv_folds+1)
+        ax.plot(folds, m_res['cv_train_acc']*100, 'o-', color='#10b981',
+                linewidth=2, markersize=6, label='Train Accuracy (CV fold)')
+        ax.plot(folds, m_res['cv_val_acc']*100, 's-', color='#667eea',
+                linewidth=2, markersize=6, label='Validation Accuracy (CV fold)')
+        ax.fill_between(folds, m_res['cv_train_acc']*100, m_res['cv_val_acc']*100,
+                        alpha=0.12, color='#f59e0b', label='Overfit gap')
+        ax.axhline(y=m_res['test_acc']*100, color='#ef4444', linestyle='--',
+                   linewidth=1.5, label=f'Final Test Acc: {m_res["test_acc"]*100:.1f}%')
+        ax.set_xlabel('CV Fold', fontsize=11)
+        ax.set_ylabel('Accuracy (%)', fontsize=11)
+        ax.set_title(f'{selected_model} — Bias-Variance Across CV Folds', fontsize=12, fontweight='bold')
+        ax.set_xticks(folds)
+        ax.legend(fontsize=10)
+        ax.set_ylim(50, 105)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close()
 
-                pipe = st.session_state["trained_pipelines"][chosen_model_name]
-                pred = int(pipe.predict(vec)[0])
+    else:
+        st.info("👈 Press **Train All Models** in the sidebar to start.")
 
-                # Show probabilities if available
-                proba = None
-                if hasattr(pipe[-1], "predict_proba"):
+# ═══════════════════════════════════════════════
+# TAB 3 — PERFORMANCE
+# ═══════════════════════════════════════════════
+with tab_perf:
+    if 'results' not in st.session_state:
+        st.info("👈 Press **Train All Models** in the sidebar first.")
+    else:
+        results = st.session_state['results']
+        X_tr, X_te, y_tr, y_te = st.session_state['splits']
+
+        model_names = list(results.keys())
+        train_accs = [results[m]['train_acc']*100 for m in model_names]
+        test_accs = [results[m]['test_acc']*100 for m in model_names]
+        cv_val_means = [results[m]['cv_val_acc'].mean()*100 for m in model_names]
+        cv_val_stds = [results[m]['cv_val_acc'].std()*100 for m in model_names]
+
+        # ── Chart 1: Train vs Test Accuracy
+        st.markdown('<div class="section-title">Train vs Test Accuracy Comparison</div>', unsafe_allow_html=True)
+        fig, ax = plt.subplots(figsize=(12, 4.5))
+        x = np.arange(len(model_names))
+        w = 0.3
+        bars1 = ax.bar(x - w/2, train_accs, w, label='Train Accuracy', color='#10b981', edgecolor='white')
+        bars2 = ax.bar(x + w/2, test_accs, w, label='Test Accuracy', color='#667eea', edgecolor='white')
+
+        for bar in bars1:
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                    f'{bar.get_height():.1f}', ha='center', va='bottom', fontsize=8.5, fontweight='bold')
+        for bar in bars2:
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                    f'{bar.get_height():.1f}', ha='center', va='bottom', fontsize=8.5, fontweight='bold')
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(model_names, fontsize=10)
+        ax.set_ylabel('Accuracy (%)', fontsize=11)
+        ax.set_title('Training vs Test Set Accuracy per Model', fontsize=13, fontweight='bold')
+        ax.legend(fontsize=11)
+        ax.set_ylim(0, 115)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        # ── Chart 2: CV Validation Accuracy with error bars
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown('<div class="section-title">CV Validation Accuracy (± std)</div>', unsafe_allow_html=True)
+            fig, ax = plt.subplots(figsize=(6, 4))
+            colors = [MODEL_COLORS[m] for m in model_names]
+            sorted_idx = np.argsort(cv_val_means)[::-1]
+            sorted_names = [model_names[i] for i in sorted_idx]
+            sorted_means = [cv_val_means[i] for i in sorted_idx]
+            sorted_stds = [cv_val_stds[i] for i in sorted_idx]
+            sorted_colors = [colors[i] for i in sorted_idx]
+
+            bars = ax.barh(sorted_names, sorted_means, xerr=sorted_stds,
+                           color=sorted_colors, edgecolor='white', capsize=4, height=0.6)
+            ax.set_xlabel('CV Validation Accuracy (%)', fontsize=10)
+            ax.set_title('Cross-Validation Accuracy ± Std Dev', fontsize=11, fontweight='bold')
+            for i, (mean, std) in enumerate(zip(sorted_means, sorted_stds)):
+                ax.text(mean + std + 0.3, i, f'{mean:.1f}', va='center', fontsize=9, fontweight='bold')
+            ax.set_xlim(0, 110)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close()
+
+        with col_b:
+            st.markdown('<div class="section-title">Overfit Index (Train - Test Gap)</div>', unsafe_allow_html=True)
+            fig, ax = plt.subplots(figsize=(6, 4))
+            gaps = [t - v for t, v in zip(train_accs, test_accs)]
+            gap_colors = ['#ef4444' if g > 5 else '#10b981' for g in gaps]
+            sorted_gap_idx = np.argsort(gaps)[::-1]
+            ax.barh([model_names[i] for i in sorted_gap_idx],
+                    [gaps[i] for i in sorted_gap_idx],
+                    color=[gap_colors[i] for i in sorted_gap_idx],
+                    edgecolor='white', height=0.6)
+            ax.axvline(x=5, color='#f59e0b', linestyle='--', linewidth=1.5, label='5% threshold')
+            ax.set_xlabel('Train Acc − Test Acc (%)', fontsize=10)
+            ax.set_title('Overfitting Gap per Model', fontsize=11, fontweight='bold')
+            ax.legend(fontsize=9)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close()
+
+        # ── Chart 3: Confusion matrix for selected model
+        st.markdown('<div class="section-title">Confusion Matrix</div>', unsafe_allow_html=True)
+        cm_model = st.selectbox("Select model for confusion matrix:", model_names, key='cm_sel')
+        y_pred = results[cm_model]['y_pred_test']
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        cm = confusion_matrix(y_te, y_pred)
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
+                    xticklabels=range(10), yticklabels=range(10),
+                    linewidths=0.5, linecolor='white')
+        ax.set_xlabel('Predicted Label', fontsize=11)
+        ax.set_ylabel('True Label', fontsize=11)
+        ax.set_title(f'{cm_model} — Confusion Matrix on Test Set', fontsize=12, fontweight='bold')
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        # ── Chart 4: Per-class F1 heatmap across all models
+        st.markdown('<div class="section-title">Per-Class F1 Score Heatmap</div>', unsafe_allow_html=True)
+        f1_matrix = {}
+        for m in model_names:
+            rep = classification_report(results[m]['y_test'], results[m]['y_pred_test'],
+                                        output_dict=True)
+            f1_matrix[m] = {str(i): rep[str(i)]['f1-score'] for i in range(10)}
+
+        f1_df = pd.DataFrame(f1_matrix).T
+        fig, ax = plt.subplots(figsize=(12, 5))
+        sns.heatmap(f1_df.astype(float)*100, annot=True, fmt='.1f', cmap='RdYlGn',
+                    ax=ax, vmin=50, vmax=100, linewidths=0.5)
+        ax.set_xlabel('Digit Class', fontsize=11)
+        ax.set_ylabel('Model', fontsize=11)
+        ax.set_title('Per-Class F1 Score (%) on Test Set', fontsize=12, fontweight='bold')
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        # ── Chart 5: Learning curve for selected model (train size effect)
+        st.markdown('<div class="section-title">Accuracy vs. Training Size (All Models)</div>', unsafe_allow_html=True)
+        X_raw2, y_raw2, _ = load_data()
+
+        @st.cache_data(show_spinner=False)
+        def compute_learning_curves(use_pca_, pca_comp_):
+            sizes = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+            curves = {m: {'train': [], 'test': []} for m in MODELS}
+            X_full, y_full, _ = load_data()
+            for sz in sizes:
+                Xtr, Xte, ytr, yte = train_test_split(X_full, y_full, train_size=sz,
+                                                       random_state=42, stratify=y_full)
+                for nm, base_m in MODELS.items():
+                    pipe = build_pipeline(base_m, use_pca_, pca_comp_)
+                    pipe.fit(Xtr, ytr)
+                    curves[nm]['train'].append(accuracy_score(ytr, pipe.predict(Xtr))*100)
+                    curves[nm]['test'].append(accuracy_score(yte, pipe.predict(Xte))*100)
+            return sizes, curves
+
+        with st.spinner("Computing learning curves..."):
+            sizes, curves = compute_learning_curves(use_pca, pca_components)
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+        for nm in model_names:
+            ax.plot([s*100 for s in sizes], curves[nm]['test'],
+                    'o-', color=MODEL_COLORS[nm], linewidth=2, markersize=5, label=nm)
+        ax.set_xlabel('Training Size (%)', fontsize=11)
+        ax.set_ylabel('Test Accuracy (%)', fontsize=11)
+        ax.set_title('Learning Curves — Test Accuracy vs Training Size', fontsize=12, fontweight='bold')
+        ax.legend(fontsize=9, bbox_to_anchor=(1.01, 1), loc='upper left')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+# ═══════════════════════════════════════════════
+# TAB 4 — DRAW & CLASSIFY
+# ═══════════════════════════════════════════════
+with tab_draw:
+    st.markdown('<div class="section-title">✏️ Draw a Digit and Classify It</div>', unsafe_allow_html=True)
+
+    if 'results' not in st.session_state:
+        st.warning("⚠️ Please train the models first (press **Train All Models** in the sidebar).")
+    else:
+        results = st.session_state['results']
+
+        col_canvas, col_result = st.columns([1, 1])
+
+        with col_canvas:
+            st.markdown("**Draw a digit (0–9) in the canvas below:**")
+            canvas_result = st_canvas(
+                fill_color="rgba(255,255,255,0)",
+                stroke_width=18,
+                stroke_color="#FFFFFF",
+                background_color="#000000",
+                height=200,
+                width=200,
+                drawing_mode="freedraw",
+                key="canvas",
+            )
+
+            classify_btn = st.button("🔍 Classify", type="primary", use_container_width=True)
+            clear_note = st.caption("Clear the canvas by refreshing the page or clicking 'New Drawing'")
+
+        with col_result:
+            st.markdown("**Classification Results:**")
+
+            if classify_btn and canvas_result.image_data is not None:
+                img_data = canvas_result.image_data
+                if img_data[:, :, :3].sum() > 100:  # not empty
                     try:
-                        proba = pipe.predict_proba(vec)[0]
-                    except Exception:
-                        proba = None
+                        processed = preprocess_canvas_image(img_data)
 
-                st.success(f"Prediction: **{pred}**")
+                        # Show preprocessed 8x8
+                        fig_prev, ax_prev = plt.subplots(figsize=(2.5, 2.5))
+                        ax_prev.imshow(processed.reshape(8, 8), cmap='Blues', vmin=0, vmax=16)
+                        ax_prev.set_title('Preprocessed (8×8)', fontsize=9)
+                        ax_prev.axis('off')
+                        fig_prev.tight_layout()
+                        st.pyplot(fig_prev)
+                        plt.close()
 
-                # Show processed 28x28 image
-                img28 = vec.reshape(28, 28)
-                figp, axp = plt.subplots(figsize=(3, 3))
-                axp.imshow(img28, cmap="gray")
-                axp.axis("off")
-                axp.set_title("Processed 28×28")
-                st.pyplot(figp)
+                        # Predict with all models
+                        pred_df_rows = []
+                        for name, res in results.items():
+                            pipe = res['pipe']
+                            pred = pipe.predict(processed)[0]
+                            if hasattr(pipe, 'predict_proba'):
+                                proba = pipe.predict_proba(processed)[0]
+                                conf = proba.max() * 100
+                            else:
+                                conf = 100.0
+                            pred_df_rows.append({'Model': name, 'Prediction': pred,
+                                                  'Confidence': f'{conf:.1f}%'})
 
-                if proba is not None and len(proba) == 10:
-                    prob_df = pd.DataFrame({"digit": np.arange(10), "probability": proba})
-                    st.dataframe(prob_df.sort_values("probability", ascending=False), use_container_width=True)
+                        pred_df = pd.DataFrame(pred_df_rows)
+                        st.dataframe(pred_df, use_container_width=True, hide_index=True)
 
-    with col2:
-        st.markdown(
-            """
-**No leakage reminder**  
-Your drawing is classified using the already-trained pipeline (scaler/PCA/model).  
-The test split was never used to fit preprocessing or model parameters.
-"""
-        )
+                        # Majority vote
+                        preds = [r['Prediction'] for r in pred_df_rows]
+                        majority = pd.Series(preds).value_counts().idxmax()
+                        st.markdown(f"""
+                        <div style='background: linear-gradient(135deg, #667eea, #764ba2);
+                                    color: white; border-radius: 12px; padding: 1.2rem;
+                                    text-align: center; margin-top: 1rem;'>
+                            <div style='font-size: 3rem; font-weight: 900;'>{majority}</div>
+                            <div style='font-size: 0.9rem; opacity: 0.85;'>Majority Vote Prediction</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    except Exception as e:
+                        st.error(f"Processing error: {e}")
+                else:
+                    st.info("The canvas appears empty. Draw a digit first!")
+            else:
+                st.markdown("""
+                <div style='text-align:center; padding: 3rem 1rem; color: #94a3b8;'>
+                    <div style='font-size: 3rem;'>👆</div>
+                    <div>Draw a digit on the left, then click <b>Classify</b></div>
+                </div>
+                """, unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────
+# FOOTER
+# ─────────────────────────────────────────────
+st.markdown("---")
+st.markdown(
+    "<div style='text-align:center; color:#94a3b8; font-size:0.8rem;'>"
+    "MNIST Classifier Studio · Built with Streamlit & scikit-learn"
+    "</div>",
+    unsafe_allow_html=True
+)
