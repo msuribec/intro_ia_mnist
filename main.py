@@ -23,6 +23,53 @@ from streamlit_drawable_canvas import st_canvas
 st.set_page_config(page_title="MNIST Classifier App", layout="wide")
 st.title("MNIST Digit Classification Toolkit")
 
+# --- Digital Image Processing (DIP) Pipeline ---
+def preprocess_canvas_image(img_array):
+    """
+    Converts a freehand canvas drawing into an 8x8 array that matches 
+    the statistical properties of the sklearn digits dataset.
+    """
+    # 1. Extract the alpha channel (drawing intensity: 0 is background, 255 is drawing)
+    alpha_channel = img_array[:, :, 3]
+    
+    # 2. Find the bounding box of the drawing to crop out empty space
+    rows = np.any(alpha_channel > 0, axis=1)
+    cols = np.any(alpha_channel > 0, axis=0)
+    
+    # If the canvas is completely empty, return None
+    if not np.any(rows) or not np.any(cols):
+        return None
+        
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+    
+    # Crop the image to the exact bounding box of the drawing
+    cropped = alpha_channel[rmin:rmax+1, cmin:cmax+1]
+    
+    # 3. Pad the cropped image to make it perfectly square (preserves aspect ratio)
+    h, w = cropped.shape
+    size = max(h, w)
+    pad_h = (size - h) // 2
+    pad_w = (size - w) // 2
+    squared = np.pad(cropped, ((pad_h, size - h - pad_h), (pad_w, size - w - pad_w)), mode='constant')
+    
+    # 4. Add a uniform margin. 
+    # The sklearn digits dataset has empty borders. We add a 30% margin.
+    margin = int(size * 0.3)
+    padded_squared = np.pad(squared, margin, mode='constant')
+    
+    # 5. Downsample to 8x8 using high-quality LANCZOS resampling (anti-aliasing)
+    img_pil = Image.fromarray(padded_squared)
+    img_8x8 = img_pil.resize((8, 8), Image.Resampling.LANCZOS)
+    
+    # 6. Convert to numpy array and scale from 0-255 to 0-16 (sklearn's format)
+    img_8x8_array = np.array(img_8x8)
+    scaled_img = (img_8x8_array / 255.0) * 16.0
+    
+    # 7. Flatten to 1x64 for the machine learning model
+    return scaled_img.reshape(1, -1)
+
+
 # 1. Load Data (Cached)
 @st.cache_data
 def get_data():
@@ -51,12 +98,10 @@ model_name = st.sidebar.selectbox("Select Classification Model",
 # 3. Model Training Logic (Heavily Cached for Deployment)
 @st.cache_resource(show_spinner="Training model and running CV...")
 def train_and_evaluate(train_size, use_pca, cv_strategy, model_name):
-    # Split
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, train_size=train_size/100.0, random_state=42, stratify=y
     )
 
-    # Pipeline
     steps = [('scaler', StandardScaler())]
     if use_pca:
         steps.append(('pca', PCA(n_components=0.95, random_state=42)))
@@ -72,7 +117,6 @@ def train_and_evaluate(train_size, use_pca, cv_strategy, model_name):
     
     pipeline = Pipeline(steps + [('classifier', models[model_name])])
 
-    # Cross Validation
     if cv_strategy == "Standard K-Fold":
         cv = KFold(n_splits=5, shuffle=True, random_state=42)
     else:
@@ -80,14 +124,12 @@ def train_and_evaluate(train_size, use_pca, cv_strategy, model_name):
         
     cv_scores = cross_val_score(pipeline, X_train, y_train, cv=cv, scoring='accuracy')
 
-    # Final Fit & Evals
     pipeline.fit(X_train, y_train)
     train_acc = accuracy_score(y_train, pipeline.predict(X_train))
     test_acc = accuracy_score(y_test, pipeline.predict(X_test))
 
     return pipeline, cv_scores, train_acc, test_acc
 
-# Execute the cached function
 pipeline, cv_scores, train_acc, test_acc = train_and_evaluate(
     train_size_pct, use_pca, cv_strategy_name, model_name
 )
@@ -119,12 +161,13 @@ with col2:
 
 # 5. Interactive Canvas
 st.header("3. Draw a Digit")
+st.write("Draw a number from 0 to 9. The image will be processed to match the training data.")
 canvas_col, result_col = st.columns(2)
 
 with canvas_col:
     canvas_result = st_canvas(
         fill_color="black",
-        stroke_width=15,
+        stroke_width=12,
         stroke_color="white",
         background_color="black",
         height=150,
@@ -134,25 +177,19 @@ with canvas_col:
     )
 
 with result_col:
-    if canvas_result.image_data is not None and np.sum(canvas_result.image_data) > 0:
-        img_array = canvas_result.image_data
-        img_pil = Image.fromarray(img_array.astype('uint8'), 'RGBA').convert('L')
-        img_resized = img_pil.resize((8, 8), Image.Resampling.LANCZOS)
-        img_8x8 = np.array(img_resized)
+    if canvas_result.image_data is not None:
+        # Pass the raw canvas drawing through our new DIP pipeline
+        processed_input = preprocess_canvas_image(canvas_result.image_data)
         
-        # Scale 0-255 to 0-16 for sklearn digits
-        img_scaled = (img_8x8 / 255.0) * 16.0
-        user_input = img_scaled.reshape(1, -1)
-        
-        # Predict instantly using the cached model
-        prediction = pipeline.predict(user_input)
-        
-        st.subheader("Prediction")
-        st.markdown(f"## **{prediction[0]}**")
-        
-        if hasattr(pipeline.named_steps['classifier'], 'predict_proba'):
-            probabilities = pipeline.predict_proba(user_input)
-            prob_df = pd.DataFrame(probabilities, columns=[str(i) for i in range(10)])
-            st.bar_chart(prob_df.T)
-        else:
-            st.write("Probabilities not available for this model type.")
+        if processed_input is not None:
+            prediction = pipeline.predict(processed_input)
+            
+            st.subheader("Prediction")
+            st.markdown(f"## **{prediction[0]}**")
+            
+            if hasattr(pipeline.named_steps['classifier'], 'predict_proba'):
+                probabilities = pipeline.predict_proba(processed_input)
+                prob_df = pd.DataFrame(probabilities, columns=[str(i) for i in range(10)])
+                st.bar_chart(prob_df.T)
+            else:
+                st.write("Probabilities not available for this model type.")
