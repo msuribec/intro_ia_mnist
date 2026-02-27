@@ -1,1 +1,0 @@
-# intro_ia_mnist
