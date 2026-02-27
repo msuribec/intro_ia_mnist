@@ -22,51 +22,53 @@ from streamlit_drawable_canvas import st_canvas
 
 st.set_page_config(page_title="MNIST Classifier App", layout="wide")
 st.title("MNIST Digit Classification Toolkit")
+
 def preprocess_canvas_image(img_array):
     """
     Converts canvas drawing to an 8x8 array matching sklearn digits.
     """
-    # 1. Extract the alpha channel
-    alpha_channel = img_array[:, :, 3]
+    # THE FIX: Use the Red channel (index 0) instead of Alpha (index 3).
+    # Background is 0, stroke is 255.
+    drawing = img_array[:, :, 0]
     
-    # 2. Check if the canvas is empty
-    if not np.any(alpha_channel > 0):
+    # Check if the canvas is empty
+    if not np.any(drawing > 0):
         return None, None
         
-    # 3. Find the bounding box to crop empty space
-    rows = np.any(alpha_channel > 0, axis=1)
-    cols = np.any(alpha_channel > 0, axis=0)
+    # Crop to the exact bounding box of the drawing
+    rows = np.any(drawing > 0, axis=1)
+    cols = np.any(drawing > 0, axis=0)
     rmin, rmax = np.where(rows)[0][[0, -1]]
     cmin, cmax = np.where(cols)[0][[0, -1]]
-    cropped = alpha_channel[rmin:rmax+1, cmin:cmax+1]
+    cropped = drawing[rmin:rmax+1, cmin:cmax+1]
     
-    # 4. Pad the crop to make it perfectly square
+    # Pad to square
     h, w = cropped.shape
     size = max(h, w)
     pad_h = (size - h) // 2
     pad_w = (size - w) // 2
     squared = np.pad(cropped, ((pad_h, size - h - pad_h), (pad_w, size - w - pad_w)), mode='constant')
     
-    # 5. Add a margin (25% mimics the sklearn digits dataset)
+    # Margin
     margin = int(size * 0.25)
     padded = np.pad(squared, margin, mode='constant')
     
-    # 6. Downsample using BOX (acts as local average pooling, better for huge scale reductions)
-    img_pil = Image.fromarray(padded)
-    img_8x8 = img_pil.resize((8, 8), Image.Resampling.BOX)
+    # Downsample
+    img_pil = Image.fromarray(padded.astype(np.uint8))
+    img_8x8 = img_pil.resize((8, 8), Image.Resampling.BILINEAR)
     img_8x8_array = np.array(img_8x8, dtype=float)
     
-    # 7. THE FIX: Thresholding
-    # Kill the background noise. Any pixel less than 20% of the max brightness becomes strictly 0.
+    # Threshold & Normalize
     if img_8x8_array.max() > 0:
-        threshold = img_8x8_array.max() * 0.20
+        # Kill background noise below 40% of max intensity
+        threshold = img_8x8_array.max() * 0.40
         img_8x8_array[img_8x8_array < threshold] = 0
-    
-        # 8. Normalize the remaining distinct strokes to strictly 0-16
+        
+        # Scale to exactly 0-16
         img_8x8_array = (img_8x8_array / img_8x8_array.max()) * 16.0
         
     return img_8x8_array.reshape(1, -1), img_8x8_array
-
+    
 # 1. Load Data
 @st.cache_data
 def get_data():
