@@ -148,4 +148,13 @@ with col2:
             st.pyplot(fig)
 
 with col3:
-    st.write("3. Model
+    st.write("3. Model Output:")
+    if canvas_result.image_data is not None and 'processed_input' in locals() and processed_input is not None:
+        prediction = pipeline.predict(processed_input)
+        
+        st.markdown(f"<h1 style='text-align: center; color: #4CAF50; font-size: 5rem;'>{prediction[0]}</h1>", unsafe_allow_html=True)
+        
+        if hasattr(pipeline.named_steps['classifier'], 'predict_proba'):
+            probabilities = pipeline.predict_proba(processed_input)
+            prob_df = pd.DataFrame(probabilities, columns=[str(i) for i in range(10)])
+            st.bar_chart(prob_df.T, height=150)
